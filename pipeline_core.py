@@ -1792,10 +1792,18 @@ def check_google_snippet_answer(page, vision_client, text_client, topic, cfg):
         # ищем "ОТВЕТ:" где угодно в тексте, а не только в первой строке.
         answer_marker = "ОТВЕТ:"
         marker_pos = stripped.upper().find(answer_marker)
-        if marker_pos != -1:
+        extracted = stripped[marker_pos + len(answer_marker):].strip() if marker_pos != -1 else ""
+        # БАГ: модель нередко пишет рассуждения вроде "...точной информации
+        # нет, поэтому ответ: NONE" - слово "ответ:" тут есть, но это НЕ
+        # найденный ответ, а её же собственное объяснение отказа. Раньше
+        # marker_pos != -1 срывался бы и возвращал текст "NONE" как будто
+        # это готовый ответ, и цикл по сайтам пропускался с мусором вместо
+        # final_answer. Проверяем, что за "ОТВЕТ:" не пустота и не само
+        # слово NONE.
+        if marker_pos != -1 and extracted and extracted.upper() != "NONE":
             log("Текст выдачи Google (DOM, без скриншота) уже содержит "
                 "готовый ответ - сайты открывать не нужно.")
-            return stripped[marker_pos + len(answer_marker):].strip()
+            return extracted
         log("В тексте DOM выдачи Google конкретного ответа не нашлось "
             "(AI Overview часто рисуется поверх обычного текста и не "
             "виден через inner_text). Пробую vision по скриншоту...")
