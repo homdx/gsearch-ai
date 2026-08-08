@@ -1,0 +1,105 @@
+name: weather_forecast
+description: >
+  Открыть страницу города на Яндекс.Погоде и получить прогноз: на
+  сегодня, на 3 дня или по часам. Город передаётся сразу в URL.
+
+dispatcher_hints:
+  examples:
+    - "погода Казань"
+    - "какая погода в Москве"
+    - "прогноз на 3 дня Новосибирск"
+    - "погода завтра Питер"
+    - "почасовой прогноз Сочи"
+    - "погода на неделю Екатеринбург"
+
+inputs:
+  city_slug:
+    type: string
+    required: true
+    hint: >
+      Транслитерируй название города латиницей в нижнем регистре для URL
+      yandex.ru/pogoda/ru/<slug>.
+      Примеры: Казань→kazan, Москва→moscow, Санкт-Петербург→saint-petersburg,
+      Новосибирск→novosibirsk, Сочи→sochi, Екатеринбург→yekaterinburg,
+      Владивосток→vladivostok, Нижний Новгород→nizhny-novgorod.
+
+  city_name:
+    type: string
+    required: true
+    hint: "Название города на русском языке как написал пользователь, например 'Казань'."
+
+  mode:
+    type: string
+    default: today
+    hint: >
+      Выбери значение из values на основе запроса пользователя.
+      Если временной период не указан явно — используй default.
+    values:
+      today:    "сегодня / текущая погода / не указан период"
+      tomorrow: "завтра"
+      3days:    "3 дня / три дня / на несколько дней / на неделю"
+      hourly:   "по часам / почасовой / каждый час"
+
+steps:
+  # today/tomorrow/hourly — главная страница города, всё есть в DOM.
+  # 3days — отдельная страница /details с таблицей на 10 дней.
+  # Навигация через меню "Ещё" → клик → vision ненадёжна:
+  # - селектор "text=Ещё" падает (кнопка рендерится не так),
+  # - vision-fallback идёт в локальную LLM (медленно, ~2 мин),
+  # - после клика браузер открывал карту осадков вместо прогноза.
+  # Прямой URL /details надёжнее и быстрее.
+  - id: open_site
+    action: open_url
+    if: "'{{mode}}' != '3days'"
+    url: "https://yandex.ru/pogoda/ru/{{city_slug}}"
+
+  - id: open_3days
+    action: open_url
+    if: "'{{mode}}' == '3days'"
+    url: "https://yandex.ru/pogoda/ru/{{city_slug}}/details"
+
+  - id: wait_load
+    action: wait
+    seconds: 2
+
+  # ШАГ 1: читаем текст DOM (дёшево, быстро, точно для числовых данных).
+  - id: extract
+    action: extract_text
+    question: >
+      {% if mode == "today" %}
+      Какая погода сегодня в городе {{city_name}}? Температура, осадки, ветер.
+      {% elif mode == "tomorrow" %}
+      Какая погода ЗАВТРА в городе {{city_name}}? Температура (утро/день/вечер/ночь), осадки, ветер.
+      {% elif mode == "3days" %}
+      Прогноз погоды на ближайшие 3 дня для города {{city_name}}: температура и осадки по дням.
+      {% elif mode == "hourly" %}
+      Почасовой прогноз погоды на сегодня для города {{city_name}}.
+      {% endif %}
+
+  # ШАГ 2: vision-fallback только если DOM не дал ответа.
+  - id: shot
+    action: screenshot
+    if: "{{extract.sufficient}} == False"
+    save_path: "screens/weather_{{city_slug}}_{{mode}}.png"
+    on_error: continue
+
+  - id: read_forecast
+    action: ask_vision
+    if: "{{extract.sufficient}} == False"
+    image_path: "{{shot.path}}"
+    prompt: >
+      {% if mode == "today" %}
+      Какая погода сегодня в городе {{city_name}}? Укажи температуру,
+      осадки и ветер коротко.
+      {% elif mode == "tomorrow" %}
+      Какая погода завтра в городе {{city_name}}? Укажи температуру
+      (утро/день/вечер/ночь), осадки и ветер коротко.
+      {% elif mode == "3days" %}
+      Дай прогноз погоды на ближайшие 3 дня для города {{city_name}}:
+      температура и осадки по дням.
+      {% elif mode == "hourly" %}
+      Дай почасовой прогноз погоды на сегодня для города {{city_name}}.
+      {% endif %}
+
+output: >
+  {% if extract.sufficient %}{{extract.result}}{% else %}{{read_forecast.result}}{% endif %}
