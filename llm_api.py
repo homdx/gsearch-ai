@@ -480,12 +480,22 @@ class LLMClient:
                     "max_tokens": max_tokens, "messages": messages,
                     "stream": False,
                 }
-                if disable_reasoning:
+                if disable_reasoning and "openrouter.ai" in self.base_url:
                     # OpenRouter-специфичный параметр - полностью убирает
                     # генерацию reasoning-токенов для моделей, которые
                     # это поддерживают. Для моделей без такой поддержки
-                    # просто игнорируется провайдером, безопасно слать
-                    # всегда, когда нужен короткий прямой ответ.
+                    # просто игнорируется провайдером, безопасно слать -
+                    # НО только когда провайдер и правда OpenRouter.
+                    #
+                    # БАГ (был): поле "reasoning" слалось ВСЕГДА при
+                    # disable_reasoning=True, независимо от провайдера.
+                    # Реальный случай: text-провайдер - Mistral API
+                    # (api.mistral.ai), формат тоже "openai"-совместимый,
+                    # но Mistral не знает поле "reasoning" и отвечает
+                    # 422 Unprocessable Entity на ЛЮБОЙ запрос с
+                    # disable_reasoning=True (например check_google_snippet_
+                    # answer). Теперь поле шлём, только если base_url
+                    # реально указывает на openrouter.ai.
                     payload["reasoning"] = {"exclude": True}
 
             raw = self._post(url, payload, timeout=self.timeout)
