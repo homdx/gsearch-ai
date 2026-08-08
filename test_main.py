@@ -16,7 +16,8 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import main
+import main  # noqa: F401  (проверяем, что тонкий main.py импортируется)
+import pipeline_core
 
 
 # ---------------------------------------------------------------------
@@ -27,7 +28,7 @@ import main
 # ---------------------------------------------------------------------
 
 def test_split_text_normal_case():
-    chunks = main.split_text_into_chunks("B" * 25000, chunk_size=10000, overlap=200)
+    chunks = pipeline_core.split_text_into_chunks("B" * 25000, chunk_size=10000, overlap=200)
     assert len(chunks) == 3
     assert len(chunks[0]) == 10000
     assert len(chunks[-1]) == 5400
@@ -35,13 +36,13 @@ def test_split_text_normal_case():
 
 def test_split_text_overlap_larger_than_chunk_size_does_not_hang():
     """Раньше это зависало бесконечно - overlap "съедал" весь шаг вперёд."""
-    chunks = main.split_text_into_chunks("A" * 1000, chunk_size=100, overlap=200)
+    chunks = pipeline_core.split_text_into_chunks("A" * 1000, chunk_size=100, overlap=200)
     assert len(chunks) > 0
     assert len(chunks) < 1000  # не бесконечный список
 
 
 def test_split_text_fits_in_one_chunk():
-    chunks = main.split_text_into_chunks("short text", chunk_size=1000)
+    chunks = pipeline_core.split_text_into_chunks("short text", chunk_size=1000)
     assert chunks == ["short text"]
 
 
@@ -58,7 +59,7 @@ def test_group_vision_answers_respects_whole_entries():
         "[Скриншот 3] " + "C" * 100,
         "[Скриншот 4] " + "D" * 100,
     ]
-    groups = main.group_vision_answers_by_budget(answers, budget=250)
+    groups = pipeline_core.group_vision_answers_by_budget(answers, budget=250)
     assert len(groups) == 2
     # каждый элемент внутри группы - целый, не разорванный
     for group in groups:
@@ -71,13 +72,13 @@ def test_group_vision_answers_single_large_entry():
     свою группу целиком (лучше превысить бюджет, чем разорвать
     конкретное описание)."""
     answers = ["X" * 500]
-    groups = main.group_vision_answers_by_budget(answers, budget=100)
+    groups = pipeline_core.group_vision_answers_by_budget(answers, budget=100)
     assert len(groups) == 1
     assert len(groups[0][0]) == 500
 
 
 def test_group_vision_answers_empty_list():
-    assert main.group_vision_answers_by_budget([], budget=100) == []
+    assert pipeline_core.group_vision_answers_by_budget([], budget=100) == []
 
 
 # ---------------------------------------------------------------------
@@ -97,7 +98,7 @@ def test_extract_main_page_text_filters_navigation():
     <footer>Реклама Metallista краска</footer>
     </body></html>
     """
-    text = main.extract_main_page_text(html)
+    text = pipeline_core.extract_main_page_text(html)
     assert "50 рейсов" in text
     assert "Меню Игры" not in text
     assert "Metallista" not in text
@@ -110,11 +111,11 @@ def test_extract_main_page_text_filters_navigation():
 # ---------------------------------------------------------------------
 
 def test_looks_like_captcha_page_detects_cloudflare():
-    assert main.looks_like_captcha_page("<html>Verify you are human</html>") is True
+    assert pipeline_core.looks_like_captcha_page("<html>Verify you are human</html>") is True
 
 
 def test_looks_like_captcha_page_false_on_normal_content():
-    assert main.looks_like_captcha_page("<html>Google Pixel 6 specs</html>") is False
+    assert pipeline_core.looks_like_captcha_page("<html>Google Pixel 6 specs</html>") is False
 
 
 # ---------------------------------------------------------------------
@@ -125,7 +126,7 @@ def test_looks_like_captcha_page_false_on_normal_content():
 
 def test_extract_keywords_generic_topic():
     topic = "правила использования бонусов Аэрофлот"
-    keywords = main.extract_keywords_from_query(topic)
+    keywords = pipeline_core.extract_keywords_from_query(topic)
     assert "прави" in keywords
     assert "бонус" in keywords
     assert "аэроф" in keywords
@@ -136,7 +137,7 @@ def test_extract_keywords_stem_matches_inflected_forms():
     корня как подстрока - "бонус" должен матчиться и с "бонусов", и
     с "бонусные"."""
     import re
-    keywords = main.extract_keywords_from_query("правила использования бонусов")
+    keywords = pipeline_core.extract_keywords_from_query("правила использования бонусов")
     pattern = re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE)
     assert pattern.search("бонусов")
     assert pattern.search("бонус")
@@ -156,18 +157,18 @@ def test_grounded_numbers_detects_hallucinated_values():
         "СОДЕРЖАТЕЛЬНЫЙ БЛОК\nAccording to AccuWeather, weather in Kazan "
         "on August 8, 2026 is forecast to have a high of 28°C and a low of 19°C."
     )
-    assert main.answer_numbers_grounded_in_source(hallucinated_answer, source) is False
+    assert pipeline_core.answer_numbers_grounded_in_source(hallucinated_answer, source) is False
 
 
 def test_grounded_numbers_accepts_real_values():
     source = "В аэропорту Казани задержаны 22 рейса на вылет и 30 рейсов на прилет"
     real_answer = "СОДЕРЖАТЕЛЬНЫЙ БЛОК\nВ аэропорту задержаны 22 рейса на вылет и 30 на прилет, всего 52."
-    assert main.answer_numbers_grounded_in_source(real_answer, source) is True
+    assert pipeline_core.answer_numbers_grounded_in_source(real_answer, source) is True
 
 
 def test_grounded_numbers_no_numbers_in_answer_passes():
     """Если в ответе вообще нет чисел - проверка неприменима, не блокируем."""
-    assert main.answer_numbers_grounded_in_source("Ответ без цифр вообще.", "любой источник") is True
+    assert pipeline_core.answer_numbers_grounded_in_source("Ответ без цифр вообще.", "любой источник") is True
 
 
 # ---------------------------------------------------------------------
@@ -183,16 +184,16 @@ def test_generate_search_query_rejects_reasoning_response():
         "The user wants a search query for the weather in Kazan on August 8, 2026.\n"
         "Since this is a future date (long-term forecast), standard weather sites usually don't have"
     )
-    with patch("main.timed_chat", return_value=reasoning_response):
-        result = main.generate_search_query(client, "погода в казани на 8 августа")
+    with patch("pipeline_core.timed_chat", return_value=reasoning_response):
+        result = pipeline_core.generate_search_query(client, "погода в казани на 8 августа")
     # должен откатиться на исходную тему, а не вернуть мусорное рассуждение
     assert result == "погода в казани на 8 августа"
 
 
 def test_generate_search_query_accepts_clean_query():
     client = MagicMock()
-    with patch("main.timed_chat", return_value='"Google Pixel 6 screen resolution"'):
-        result = main.generate_search_query(client, "разрешение экрана Pixel 6")
+    with patch("pipeline_core.timed_chat", return_value='"Google Pixel 6 screen resolution"'):
+        result = pipeline_core.generate_search_query(client, "разрешение экрана Pixel 6")
     assert result == "Google Pixel 6 screen resolution"
 
 
@@ -203,8 +204,8 @@ def test_generate_search_query_accepts_clean_query():
 
 def test_analyze_vision_answer_parses_all_fields():
     fake_answer = "SUFFICIENT: no\nELEMENT: NONE\nZOOM_REGION: top_center"
-    with patch("main.timed_chat", return_value=fake_answer):
-        is_sufficient, element_text, zoom_region = main.analyze_vision_answer(
+    with patch("pipeline_core.timed_chat", return_value=fake_answer):
+        is_sufficient, element_text, zoom_region = pipeline_core.analyze_vision_answer(
             MagicMock(), "some vision text", "topic")
     assert is_sufficient is False
     assert element_text is None
@@ -213,8 +214,8 @@ def test_analyze_vision_answer_parses_all_fields():
 
 def test_analyze_vision_answer_sufficient_with_element():
     fake_answer = 'SUFFICIENT: yes\nELEMENT: "Условия получения премий"\nZOOM_REGION: NONE'
-    with patch("main.timed_chat", return_value=fake_answer):
-        is_sufficient, element_text, zoom_region = main.analyze_vision_answer(
+    with patch("pipeline_core.timed_chat", return_value=fake_answer):
+        is_sufficient, element_text, zoom_region = pipeline_core.analyze_vision_answer(
             MagicMock(), "some vision text", "topic")
     assert is_sufficient is True
     assert element_text == "Условия получения премий"
@@ -236,8 +237,8 @@ def test_give_up_summary_single_pass_when_fits():
         call_count["n"] += 1
         return "Короткое резюме без деления на части."
 
-    with patch("main.timed_chat", fake_timed_chat):
-        result = main.make_give_up_summary(client, "тема", "короткий текст", sites_count=1)
+    with patch("pipeline_core.timed_chat", fake_timed_chat):
+        result = pipeline_core.make_give_up_summary(client, "тема", "короткий текст", sites_count=1)
 
     assert result == "Короткое резюме без деления на части."
     assert call_count["n"] == 1
@@ -262,8 +263,8 @@ def test_give_up_summary_multi_pass_preserves_important_detail():
         return ("СЖАТОЕ РЕЗЮМЕ: точных данных почти нет, но упомянута температура "
                 "25 градусов. Точного ответа найти не удалось.")
 
-    with patch("main.timed_chat", fake_timed_chat):
-        result = main.make_give_up_summary(client, "какая температура", raw_notes, sites_count=2)
+    with patch("pipeline_core.timed_chat", fake_timed_chat):
+        result = pipeline_core.make_give_up_summary(client, "какая температура", raw_notes, sites_count=2)
 
     assert "25" in result
     assert len(call_log) > 1  # реально было несколько проходов (map + reduce)
