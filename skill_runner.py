@@ -27,6 +27,7 @@ skill_runner.py — исполняет скилл, описанный в YAML (�
 import argparse
 import configparser
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,13 @@ from playwright.sync_api import sync_playwright
 import skill_primitives as prim
 import llm_api
 from llm_api import LLMClient
+
+# Путь по умолчанию для скриншотов в шагах "screenshot" YAML-скиллов
+# (см. save_path: "screens/..." в skills/*.yaml) - вынесено в константу,
+# чтобы очистка перед прогоном (run_skill) точно чистила ТУ ЖЕ папку,
+# куда потом пишут скриншоты сами скиллы, а не разъезжалась с ней при
+# правке путей в одном месте и забытой в другом.
+SCREENS_DIR = "screens"
 
 
 def _log(msg: str):
@@ -116,6 +124,29 @@ def run_skill(skill_path: str, inputs: dict, headless: bool = False,
     final_text = None
 
     _log(f"Запускаю скилл '{skill.get('name')}' с inputs={inputs}")
+
+    # Очистка screens/ перед прогоном - как в main.py (pc.SCREENS_DIR):
+    # без этого файлы копятся бессрочно, единственная защита раньше
+    # была в том, что имя скриншота зависит от city_slug+mode
+    # (screen_kazan_month.png) - разные комбинации города/режима просто
+    # накапливались в screens/ вечно, ничего не подчищая.
+    #
+    # ВНИМАНИЕ: путь "screens/" - общий для ВСЕХ скиллов и ВСЕХ
+    # profile_dir (в отличие от main.py, где SCREENS_DIR лежит ВНУТРИ
+    # выбранного --profile-dir именно чтобы избежать этой гонки - см.
+    # комментарий у SCREENS_DIR в pipeline_core.py). Если dispatcher.py
+    # или что-то ещё запускает НЕСКОЛЬКО skill_runner.py ПАРАЛЛЕЛЬНО,
+    # они будут удалять скриншоты друг друга - оборачиваем удаление в
+    # try/except, чтобы гонка (файл уже удалён другим процессом) не
+    # роняла текущий прогон с FileNotFoundError.
+    os.makedirs(SCREENS_DIR, exist_ok=True)
+    for fname in os.listdir(SCREENS_DIR):
+        fpath = os.path.join(SCREENS_DIR, fname)
+        try:
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+        except OSError as e:
+            _log(f"Не смог удалить старый скриншот {fpath}: {e}")
 
     step_error = None  # (message,) - если шаг провалился с on_error=stop
 
