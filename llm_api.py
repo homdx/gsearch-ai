@@ -55,6 +55,58 @@ except ImportError:
 # выход в интернет, а не на петлю до localhost).
 NO_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
+# Накопитель реально потреблённых токенов за весь прогон - ТОЛЬКО из
+# того, что провайдер сам прислал в ответе (поле "usage" у OpenAI-
+# совместимых API, "prompt_eval_count"/"eval_count" у Ollama). Ничего
+# не запрашивается у модели дополнительно и не требуется в промптах -
+# если провайдер это поле не прислал (бывает у некоторых бесплатных/
+# урезанных эндпоинтов), просто не считаем, никаких попыток угадать.
+TOKEN_STATS = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "requests_with_usage": 0,   # на скольких ответах usage реально был
+}
+
+
+def get_token_stats_or_none() -> dict | None:
+    """Снимок TOKEN_STATS для итогового JSON. Возвращает None, если ни
+    один ответ за весь прогон не содержал usage/eval-полей - чтобы в
+    JSON не появлялось лживое "tokens_total": 0, будто токены посчитаны,
+    когда на самом деле провайдер их просто не присылал."""
+    if TOKEN_STATS["requests_with_usage"] == 0:
+        return None
+    return dict(TOKEN_STATS)
+
+
+def _accumulate_usage(raw: dict, api_format: str) -> None:
+    """Пополняет TOKEN_STATS данными из одного raw-ответа API, если они
+    там есть. Молча ничего не делает, если usage/eval-полей нет."""
+    if api_format == "ollama":
+        prompt = raw.get("prompt_eval_count")
+        completion = raw.get("eval_count")
+        if prompt is None and completion is None:
+            return
+        prompt = prompt or 0
+        completion = completion or 0
+        TOKEN_STATS["prompt_tokens"] += prompt
+        TOKEN_STATS["completion_tokens"] += completion
+        TOKEN_STATS["total_tokens"] += prompt + completion
+        TOKEN_STATS["requests_with_usage"] += 1
+    else:
+        usage = raw.get("usage")
+        if not usage:
+            return
+        prompt = usage.get("prompt_tokens") or 0
+        completion = usage.get("completion_tokens") or 0
+        total = usage.get("total_tokens")
+        if total is None:
+            total = prompt + completion
+        TOKEN_STATS["prompt_tokens"] += prompt
+        TOKEN_STATS["completion_tokens"] += completion
+        TOKEN_STATS["total_tokens"] += total
+        TOKEN_STATS["requests_with_usage"] += 1
+
 
 def strip_think(text: str) -> str:
     """Вырезает <think>...</think>, если модель вернула reasoning-блок."""
@@ -440,6 +492,7 @@ class LLMClient:
             # Проверка на ошибку теперь внутри _post() (с retry) - сюда
             # raw попадает уже гарантированно без "error" в теле, либо
             # _post() выбросил бы исключение после исчерпания попыток.
+            _accumulate_usage(raw, self.api_format)
             content_field = (raw.get("message", {}).get("content", "")
                              if self.api_format == "ollama"
                              else raw["choices"][0]["message"].get("content", ""))
@@ -534,6 +587,7 @@ class LLMClient:
 
         raw = self._post(url, payload, timeout=self.timeout_vision)
         # Проверка на ошибку теперь внутри _post() (с retry).
+        _accumulate_usage(raw, self.api_format)
         content = (raw.get("message", {}).get("content", "")
                    if self.api_format == "ollama"
                    else raw["choices"][0]["message"]["content"])

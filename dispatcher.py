@@ -16,14 +16,63 @@ import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import llm_api
 from llm_api import LLMClient
 
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 UNKNOWN_INTENT = "unknown"
+
+# Silent-режим — как RUN_STATS["silent"] в main.py и prim.SILENT в
+# skill_runner.py/skill_primitives.py: читается из конфига (секция [api],
+# ключ silent). Раньше dispatcher.py его вообще не проверял и всегда
+# печатал свои служебные строки ("[dispatcher] ...") напрямую через
+# print(), из-за чего silent-режим ломался именно на уровне диспетчера -
+# skill_runner ниже по стеку молчал правильно, а сам dispatcher - нет.
+SILENT = False
+
+
+def dispatcher_print(*args, **kwargs):
+    """Замена print() для служебного вывода dispatcher.py - в
+    silent-режиме молчит, как log()/silent_aware_print() в main.py."""
+    if SILENT:
+        return
+    print(*args, **kwargs)
+
+
+def _token_usage_delta(before: dict, after: dict):
+    """Разница между двумя снимками llm_api.TOKEN_STATS. Возвращает
+    None, если за это время usage ни разу не пришёл от провайдера
+    (requests_with_usage не увеличился) - т.е. как и в get_token_stats_
+    or_none(), не показываем "0 токенов", если реально ничего не мерили."""
+    if after["requests_with_usage"] == before["requests_with_usage"]:
+        return None
+    return {
+        "prompt_tokens": after["prompt_tokens"] - before["prompt_tokens"],
+        "completion_tokens": after["completion_tokens"] - before["completion_tokens"],
+        "total_tokens": after["total_tokens"] - before["total_tokens"],
+        "requests_with_usage": after["requests_with_usage"] - before["requests_with_usage"],
+    }
+
+
+def _merge_token_usage(a, b):
+    """Складывает два token_usage-словаря (каждый может быть None, если
+    usage для этой части не мерился). None + None -> None."""
+    if a is None and b is None:
+        return None
+    a = a or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests_with_usage": 0}
+    b = b or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests_with_usage": 0}
+    return {
+        "prompt_tokens": a["prompt_tokens"] + b["prompt_tokens"],
+        "completion_tokens": a["completion_tokens"] + b["completion_tokens"],
+        "total_tokens": a["total_tokens"] + b["total_tokens"],
+        "requests_with_usage": a["requests_with_usage"] + b["requests_with_usage"],
+    }
 
 
 # ─── Загрузка реестра скиллов прямо из YAML ──────────────────────────────────
@@ -130,7 +179,7 @@ def classify(user_input: str, client: LLMClient, skills: dict) -> dict:
     try:
         return json.loads(raw.strip())
     except json.JSONDecodeError as e:
-        print(f"[dispatcher] Не смог распарсить JSON от LLM: {e}\nСырой ответ:\n{raw}")
+        dispatcher_print(f"[dispatcher] Не смог распарсить JSON от LLM: {e}\nСырой ответ:\n{raw}")
         return {"intent": UNKNOWN_INTENT, "inputs": {}, "confidence": 0.0}
 
 
@@ -146,13 +195,18 @@ def run_skill(skill_yaml: str, inputs: dict, config_path: str) -> dict:
         *input_args,
         "--config", config_path,
     ]
-    print(f"[dispatcher] → {' '.join(cmd)}")
+    dispatcher_print(f"[dispatcher] → {' '.join(cmd)}")
 
     # Popen со стримингом: stdout читаем построчно и сразу печатаем —
     # LLM_DEBUG, логи skill_runner и прогресс видны в реальном времени,
     # а не после завершения всего прогона.
     # stderr=None — наследуем у родителя (идёт в терминал напрямую).
     # Все строки stdout собираем, чтобы в конце распарсить итоговый JSON.
+    # В silent-режиме сам skill_runner.py (через prim.SILENT) печатает в
+    # свой stdout ТОЛЬКО финальный JSON - поэтому стриминг здесь можно не
+    # отключать отдельно, но дублировать его dispatcher_print'ом не нужно:
+    # используем silent-aware вывод, чтобы соблюсти контракт "ничего кроме
+    # финального ответа" даже если skill_runner всё же что-то напечатает.
     try:
         proc = subprocess.Popen(
             cmd,
@@ -167,7 +221,8 @@ def run_skill(skill_yaml: str, inputs: dict, config_path: str) -> dict:
 
     lines = []
     for line in proc.stdout:
-        print(line, end="", flush=True)   # стриминг в терминал
+        if not SILENT:
+            print(line, end="", flush=True)   # стриминг в терминал
         lines.append(line)
     proc.wait()
 
@@ -194,28 +249,76 @@ def run_skill(skill_yaml: str, inputs: dict, config_path: str) -> dict:
 
 # ─── Основной цикл ────────────────────────────────────────────────────────────
 
-def dispatch(user_input: str, client: LLMClient, skills: dict, config_path: str) -> str:
-    print(f"\n[dispatcher] Вход: «{user_input}»")
+def dispatch(user_input: str, client: LLMClient, skills: dict, config_path: str) -> dict:
+    """Возвращает структурированный результат в ТОМ ЖЕ формате, что и
+    write_result_and_exit() в main.py / финальный JSON в skill_runner.py:
+    started_at/finished_at/duration_seconds/llm_requests_total — чтобы
+    и через dispatcher.py, и напрямую было видно время выполнения и
+    количество LLM-запросов, а не только сам ответ.
+
+    llm_requests_total здесь = 1 запрос классификации intent (делает сам
+    dispatcher, через свой client) + llm_requests_total из JSON, который
+    вернул skill_runner.py (запросы внутри самого скилла) - т.е. это
+    ПОЛНАЯ сумма LLM-запросов за весь вызов, а не только часть скилла.
+    """
+    started_at = datetime.now(timezone.utc)
+    t_start = time.monotonic()
+
+    dispatcher_print(f"\n[dispatcher] Вход: «{user_input}»")
+
+    # Снимок TOKEN_STATS ДО классификации - чтобы посчитать usage именно
+    # этого вызова classify(), а не накопленную сумму за весь процесс
+    # (важно для REPL-режима, где dispatch() вызывается много раз подряд
+    # в одном и том же процессе, и llm_api.TOKEN_STATS копится сквозным
+    # итогом, если его не снимать разницей на каждом вызове).
+    tokens_before = dict(llm_api.TOKEN_STATS)
 
     result = classify(user_input, client, skills)
     intent = result.get("intent", UNKNOWN_INTENT)
     inputs = result.get("inputs", {})
     confidence = result.get("confidence", 0.0)
+    classify_llm_requests = 1  # один вызов client.chat() внутри classify()
 
-    print(f"[dispatcher] Намерение: {intent} (confidence={confidence:.2f}), inputs={inputs}")
+    dispatcher_print(f"[dispatcher] Намерение: {intent} (confidence={confidence:.2f}), inputs={inputs}")
+
+    classify_token_usage = _token_usage_delta(tokens_before, llm_api.TOKEN_STATS)
+
+    def finalize(success: bool, error, final_answer, skill_meta: dict = None) -> dict:
+        finished_at = datetime.now(timezone.utc)
+        duration_sec = round(time.monotonic() - t_start, 1)
+        llm_requests_total = classify_llm_requests + (
+            (skill_meta or {}).get("llm_requests_total", 0)
+        )
+        token_usage = _merge_token_usage(
+            classify_token_usage, (skill_meta or {}).get("token_usage")
+        )
+        return {
+            "input": user_input,
+            "intent": intent,
+            "inputs": inputs,
+            "confidence": confidence,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_seconds": duration_sec,
+            "llm_requests_total": llm_requests_total,
+            "token_usage": token_usage,
+            "success": success,
+            "final_answer": final_answer,
+            "error": error,
+        }
 
     if intent == UNKNOWN_INTENT or intent not in skills:
-        return f"Не понял запрос или нет подходящего скилла для: «{user_input}»"
+        return finalize(False, f"Не понял запрос или нет подходящего скилла для: «{user_input}»", None)
 
     if confidence < 0.5:
-        return f"Низкая уверенность ({confidence:.2f}) в распознавании: «{user_input}»"
+        return finalize(False, f"Низкая уверенность ({confidence:.2f}) в распознавании: «{user_input}»", None)
 
     skill_result = run_skill(skills[intent]["yaml"], inputs, config_path)
 
     if skill_result.get("success"):
-        return skill_result.get("final_answer") or "(пустой ответ)"
+        return finalize(True, None, skill_result.get("final_answer") or "(пустой ответ)", skill_result)
     else:
-        return f"Скилл завершился с ошибкой: {skill_result.get('error')}"
+        return finalize(False, f"Скилл завершился с ошибкой: {skill_result.get('error')}", None, skill_result)
 
 
 def load_client(config_path: str) -> LLMClient:
@@ -235,6 +338,15 @@ def load_client(config_path: str) -> LLMClient:
     cfg = configparser.ConfigParser()
     cfg.read(config_path, encoding="utf-8")
 
+    # silent читается ИЗ КОНФИГА ДО первого вывода — как RUN_STATS["silent"]
+    # в main.py и prim.SILENT в skill_runner.py — иначе строки вида
+    # "[dispatcher] Клиент классификации: ..." успели бы напечататься до
+    # того, как мы узнали, что должны молчать. Именно в этом была причина
+    # бага: SILENT никогда не выставлялся, поэтому dispatcher.py печатал
+    # свои служебные сообщения независимо от silent = true/false в конфиге.
+    global SILENT
+    SILENT = cfg.getboolean("api", "silent", fallback=False)
+
     # Используем text_api (как skill_runner/main для текста), а не [api] (vision).
     # Если text_api не задан — fallback на [api], как в skill_runner.py.
     if cfg.has_section("text_api"):
@@ -245,8 +357,8 @@ def load_client(config_path: str) -> LLMClient:
     active = cfg.get(section, "active", fallback="local")
     model  = cfg.get(f"{section}_{active}", "model", fallback="?")
     base   = cfg.get(f"{section}_{active}", "base_url", fallback="?")
-    print(f"[dispatcher] Клиент классификации: секция=[{section}] active={active!r} "
-          f"model={model!r} base_url={base!r}")
+    dispatcher_print(f"[dispatcher] Клиент классификации: секция=[{section}] active={active!r} "
+                      f"model={model!r} base_url={base!r}")
 
     return LLMClient.from_config(cfg, config_section=section), cfg
 
@@ -260,26 +372,38 @@ def main():
     # Загружаем скиллы из YAML при старте
     skills = load_skills()
     if not skills:
+        # Отсутствие скиллов — фатальная ошибка запуска, а не обычный лог;
+        # печатаем её даже в silent-режиме, иначе процесс молча падает.
         print(f"[dispatcher] Не найдено ни одного скилла в {SKILLS_DIR}")
         sys.exit(1)
-    print(f"[dispatcher] Загружено скиллов: {list(skills.keys())}")
+    dispatcher_print(f"[dispatcher] Загружено скиллов: {list(skills.keys())}")
 
     if len(sys.argv) > 1:
         user_input = " ".join(sys.argv[1:])
-        answer = dispatch(user_input, client, skills, config_path)
-        print(f"\n{'='*60}\n{answer}\n{'='*60}")
+        result = dispatch(user_input, client, skills, config_path)
+        if SILENT:
+            # silent = true -> ТОЛЬКО JSON на stdout, как в main.py и
+            # skill_runner.py - никакого текста ни до, ни после.
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            answer = result.get("final_answer") if result.get("success") else result.get("error")
+            print(f"\n{'='*60}\n{answer}\n{'='*60}")
     else:
-        print("Диспетчер запущен. Введите запрос (или 'выход'):")
+        dispatcher_print("Диспетчер запущен. Введите запрос (или 'выход'):")
         while True:
             try:
                 user_input = input("\n> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nВыход.")
+                dispatcher_print("\nВыход.")
                 break
             if not user_input or user_input.lower() in ("выход", "exit", "quit", "q"):
                 break
-            answer = dispatch(user_input, client, skills, config_path)
-            print(f"\n{'='*60}\n{answer}\n{'='*60}")
+            result = dispatch(user_input, client, skills, config_path)
+            if SILENT:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                answer = result.get("final_answer") if result.get("success") else result.get("error")
+                print(f"\n{'='*60}\n{answer}\n{'='*60}")
 
 
 if __name__ == "__main__":

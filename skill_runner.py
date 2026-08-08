@@ -36,6 +36,7 @@ from jinja2 import Template
 from playwright.sync_api import sync_playwright
 
 import skill_primitives as prim
+import llm_api
 from llm_api import LLMClient
 
 
@@ -205,6 +206,7 @@ def run_skill(skill_path: str, inputs: dict, headless: bool = False,
         "finished_at": finished_at.isoformat(),
         "duration_seconds": duration_sec,
         "llm_requests_total": prim.RUN_STATS["llm_requests_total"],
+        "token_usage": llm_api.get_token_stats_or_none(),
         "success": success,
         "final_answer": final_text,
         "error": error,
