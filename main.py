@@ -71,6 +71,7 @@ from pipeline_core import (
     check_google_snippet_answer,
     process_candidate_site,
     make_give_up_summary,
+    summarize_validator_verdict,
     timed_chat,
 )
 import llm_api
@@ -564,11 +565,22 @@ def main():
     validator_says_hallucination = "галлюцинац" in verdict_line.lower()
     success = not validator_says_hallucination
 
+    # Сжимаем вердикт валидатора отдельным LLM-запросом ПОСЛЕ того, как
+    # success уже определён по исходному (несжатому) validator_answer -
+    # сжатие только для показа пользователю, на success никак не влияет.
+    # final_answer (сам найденный по теме ответ) не трогаем - режем
+    # только длинное обоснование валидатора.
+    log("Сжимаю заключение валидатора для пользователя...")
+    validator_verdict_short = summarize_validator_verdict(
+        text_client, topic, validator_answer)
+    silent_aware_print("\nВердикт валидатора (сжато):")
+    silent_aware_print(validator_verdict_short)
+
     write_result_and_exit(
         cfg, topic=topic, search_query=search_query_used,
         started_at=run_started_at, t_run_start=t_run_start,
         success=success, final_answer=final_answer,
-        validator_verdict=validator_answer,
+        validator_verdict=validator_verdict_short,
         error=None if success else "validator flagged result as hallucination")
 
 
