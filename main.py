@@ -45,6 +45,7 @@ import argparse
 import configparser
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -75,6 +76,103 @@ from pipeline_core import (
 import llm_api
 from llm_api import LLMClient
 from playwright.sync_api import sync_playwright
+
+# Если в теме запроса встречается это слово - main.py не запускает свой
+# тяжёлый пайплайн (Chrome, HTML/vision-анализ сайтов), а делегирует
+# запрос специализированному dispatcher.py (он сам классифицирует текст
+# через LLM и запускает нужный скилл, например skills/weather_forecast.yaml).
+WEATHER_KEYWORD = "погода"
+
+
+def _extract_json_from_output(stdout: str):
+    """dispatcher.py в silent-режиме (silent=true в config_vision.ini)
+    печатает В STDOUT ЧИСТЫЙ JSON и больше ничего. Но на случай, если
+    туда всё же попадёт что-то постороннее (например предупреждение
+    сторонней библиотеки на первой строке) - берём JSON-объект между
+    первой '{' и последней '}', а не пытаемся распарсить весь stdout
+    целиком. Возвращает dict или None, если валидный JSON не найден."""
+    if not stdout:
+        return None
+    start = stdout.find("{")
+    end = stdout.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(stdout[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def run_dispatcher_and_exit(topic, started_at, t_run_start):
+    """Запускает dispatcher.py как отдельный процесс с темой из --topic
+    (аналог "python3 dispatcher.py \"погода в казани сегодня\""),
+    забирает его ответ и возвращает JSON - в том же формате/контракте,
+    что и write_result_and_exit(), чтобы вызывающая сторона (другой
+    скрипт/AI) не заботилась о том, какая ветка (main.py напрямую или
+    dispatcher.py) обработала запрос. Всегда завершает процесс (sys.exit)."""
+    dispatcher_path = os.path.join(SCRIPT_DIR, "dispatcher.py")
+    log(f"В теме обнаружено слово \"{WEATHER_KEYWORD}\" - делегирую запрос "
+        f"dispatcher.py вместо основного пайплайна main.py: "
+        f"python3 {dispatcher_path} \"{topic}\"")
+
+    t0 = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, dispatcher_path, topic],
+        cwd=SCRIPT_DIR,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    elapsed_sec = round(time.monotonic() - t0, 1)
+    log(f"dispatcher.py завершился за {elapsed_sec} сек, код возврата={proc.returncode}")
+    if proc.stderr.strip():
+        log(f"dispatcher.py stderr:\n{proc.stderr.strip()}")
+
+    dispatcher_result = _extract_json_from_output(proc.stdout)
+    finished_at = datetime.now(timezone.utc)
+    duration_sec = round(time.monotonic() - t_run_start, 1)
+
+    if dispatcher_result is not None:
+        # dispatcher.py уже вернул структурированный JSON (silent=true в
+        # его конфиге) - используем его как есть, только помечаем, что
+        # запрос был делегирован, и подстраховываемся на случай
+        # отсутствия поля topic.
+        result = dict(dispatcher_result)
+        result.setdefault("topic", topic)
+        result.setdefault("success", proc.returncode == 0)
+        result["delegated_to"] = "dispatcher.py"
+    else:
+        # dispatcher.py не в silent-режиме (печатает читаемый текст, а не
+        # JSON) либо упал до печати результата - собираем JSON сами из
+        # сырого вывода, чтобы контракт "main.py всегда отдаёт JSON" не
+        # ломался независимо от настроек dispatcher.py.
+        result = {
+            "topic": topic,
+            "delegated_to": "dispatcher.py",
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_seconds": duration_sec,
+            "success": proc.returncode == 0,
+            "final_answer": proc.stdout.strip() or None,
+            "error": None if proc.returncode == 0
+                     else (proc.stderr.strip() or f"dispatcher.py завершился с кодом {proc.returncode}"),
+        }
+
+    result_json = json.dumps(result, ensure_ascii=False, indent=2)
+
+    if RUN_STATS["silent"]:
+        # silent = true -> ТОЛЬКО JSON в консоль, как и в
+        # write_result_and_exit() для обычной ветки main.py.
+        print(result_json)
+    else:
+        result_path = os.path.join(SCRIPT_DIR, "result.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+            f.write(result_json)
+        silent_aware_print(f"\nРезультат сохранён в {result_path}")
+        silent_aware_print(result_json)
+
+    sys.exit(0 if result.get("success") else 1)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -142,6 +240,17 @@ def main():
 
     log(f"Тема поиска: \"{topic}\"")
     log(f"Ключевые слова для поиска блоков в HTML: {keywords}")
+
+    # Если тема касается погоды - не гоняем основной пайплайн main.py
+    # (Chrome, HTML/vision-анализ сайтов), а прокидываем текст темы в
+    # dispatcher.py как есть (у него уже есть готовый скилл
+    # skills/weather_forecast.yaml) и возвращаем его JSON-ответ.
+    # По умолчанию (слова "погода" нет) main.py работает как раньше -
+    # без изменений в остальной логике.
+    if WEATHER_KEYWORD in topic.lower():
+        run_dispatcher_and_exit(topic, run_started_at, t_run_start)
+        # run_dispatcher_and_exit() всегда завершает процесс через
+        # sys.exit() - до сюда выполнение не доходит.
 
     # Чистим скриншоты от ПРЕДЫДУЩЕГО прогона сразу при старте, а не
     # только когда реально понадобится fallback на vision - иначе если
