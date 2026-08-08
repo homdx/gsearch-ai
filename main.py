@@ -89,6 +89,12 @@ CAPTCHA_MARKERS = [
     "verify you are human", "checking your browser",
     "cloudflare", "cf-turnstile", "проверка браузера",
     "подтвердите, что вы человек", "attention required",
+    # Реальный случай: gogov.ru отдал капчу с формулировкой "подтвердите,
+    # что вы не робот" / "слишком частые запросы" / "Секундочку..." - ни
+    # одна из фраз выше её не ловила, страница ушла в vision-fallback
+    # вместо мгновенного пропуска на следующий результат.
+    "подтвердите, что вы не робот", "слишком частые запросы",
+    "секундочку...",
 ]
 
 
@@ -374,6 +380,28 @@ VISION_PROMPT_TMPL = (
     "правила по этой теме.\n"
     "3) Опиши подробно, что именно ты видишь на изображении.\n"
     "Отвечай только на основе того, что реально видно, ничего не придумывай."
+)
+
+# Текстовая (не-vision) проверка сниппета/AI Overview прямо в выдаче
+# Google - берём текст из DOM через inner_text (бесплатно и быстро,
+# в отличие от vision-запроса по скриншоту) и спрашиваем текстовую
+# модель, есть ли там уже конкретный ответ на тему. К vision-скриншоту
+# выдачи переходим только если тут пусто/не хватило - так же, как на
+# обычных сайтах сначала пробуется текстовый путь (run_pipeline), а
+# vision - fallback.
+GOOGLE_SNIPPET_TEXT_SYSTEM = (
+    "Ты читаешь текст, вытащенный из верхней части страницы результатов "
+    "поиска Google (featured snippet, AI Overview или начало первого "
+    "результата). Отвечай СРАЗУ, без вступления и рассуждений."
+)
+
+GOOGLE_SNIPPET_TEXT_PROMPT_TMPL = (
+    "Тема/вопрос пользователя: {topic}\n\n"
+    "Текст из верхней части выдачи Google:\n---\n{text}\n---\n\n"
+    "Если в этом тексте уже есть КОНКРЕТНЫЙ ответ на тему (конкретные "
+    "цифры/факты/даты, а не просто упоминание темы) - ответь одной "
+    "строкой в формате:\nОТВЕТ: <сам ответ, 1-3 предложения>\n\n"
+    "Если конкретного ответа тут нет - ответь ровно одним словом: NONE"
 )
 
 # Мини-запрос ПОСЛЕ vision-описания скриншота: проверяем, не пропустили
@@ -1540,6 +1568,119 @@ def process_candidate_site(page, text_client: LLMClient, vision_client: LLMClien
     return final_answer, is_sufficient
 
 
+def check_google_snippet_answer(page, vision_client, text_client, topic, cfg):
+    """Перед тем как открывать любой сайт из выдачи, проверяем - вдруг ответ
+    уже есть прямо на странице результатов Google (featured snippet под
+    первым результатом, или блок AI Overview). Сначала пробуем ДЕШЁВЫЙ
+    текстовый путь через DOM (inner_text), и только если он ничего не дал -
+    падаем в vision по скриншоту, точно так же, как обычные сайты сперва
+    проверяются текстом (run_pipeline), а vision - fallback на крайний
+    случай.
+
+    Реальный случай: тема "Август 2026 распродажа авиакомпании даты?" -
+    ответ ("Nordwind, с 5 по 11 августа 2026") был виден прямо в тексте
+    featured snippet на странице Google, а пайплайн вместо этого шёл на
+    первый результат (капча), потом на второй (галлюцинация) - хотя текст
+    ответа лежал в DOM с самого начала, бесплатно и без единого vision-
+    запроса.
+
+    Возвращает текст ответа, если он найден прямо в выдаче, иначе None (и
+    вызывающий код идёт по обычному пути - открывает сайты по очереди).
+    """
+    if not cfg.getboolean("google", "check_snippet_before_opening_links", fallback=True):
+        return None
+
+    log("Смотрю, нет ли готового ответа прямо в выдаче Google (сниппет/AI "
+        "Overview), прежде чем открывать сайты по очереди...")
+
+    # --- Шаг 1: текст из DOM, без единого vision/скриншот-запроса ---
+    search_text = ""
+    try:
+        search_text = page.locator("#search").first.inner_text(timeout=5000)
+    except Exception as e:
+        log(f"Не удалось прочитать текст выдачи из DOM ({e}), "
+            f"перехожу сразу к vision-проверке скриншота.")
+
+    # Верхняя часть выдачи (сниппет/AI Overview обычно в первых ~2000
+    # символов) - не тащим в LLM весь список из 10 результатов с
+    # URL-мусором, это только размывает ответ и тратит бюджет токенов.
+    top_text = search_text.strip()[:2000]
+
+    if top_text:
+        text_answer = timed_chat(
+            text_client,
+            system=GOOGLE_SNIPPET_TEXT_SYSTEM,
+            user=GOOGLE_SNIPPET_TEXT_PROMPT_TMPL.format(topic=topic, text=top_text),
+            # БАГ (был): max_tokens=200, max_continuations=1 - модель тратит
+            # бюджет на пересказ "The user is asking..." + перечисление
+            # сниппетов ДО того, как дойти до "ОТВЕТ:", и сам ответ обрывался
+            # на середине предложения ("...до 9 августа 2026 года вклю").
+            # Бюджет побольше и лишняя докрутка дают модели место закончить
+            # мысль после преамбулы, которую она всё равно пишет вопреки
+            # системному промпту.
+            max_tokens=400,
+            disable_reasoning=True,
+            max_continuations=2,
+        )
+        silent_aware_print(text_answer)
+        stripped = text_answer.strip()
+        # БАГ (был): проверяли stripped.upper().startswith("ОТВЕТ") - но
+        # nemotron иногда игнорирует "отвечай СРАЗУ" и сначала пишет
+        # рассуждения (по-английски), а "ОТВЕТ:" оказывается где-то в
+        # середине текста. Реальный случай: модель честно перечислила все
+        # найденные распродажи и в конце написала "ОТВЕТ: Nordwind Airlines
+        # проводит распродажу с 5 по 11 августа 2026..." - но startswith
+        # это пропустил, и пайплайн зря пошёл в vision-скриншот. Теперь
+        # ищем "ОТВЕТ:" где угодно в тексте, а не только в первой строке.
+        answer_marker = "ОТВЕТ:"
+        marker_pos = stripped.upper().find(answer_marker)
+        if marker_pos != -1:
+            log("Текст выдачи Google (DOM, без скриншота) уже содержит "
+                "готовый ответ - сайты открывать не нужно.")
+            return stripped[marker_pos + len(answer_marker):].strip()
+        log("В тексте DOM выдачи Google конкретного ответа не нашлось "
+            "(AI Overview часто рисуется поверх обычного текста и не "
+            "виден через inner_text). Пробую vision по скриншоту...")
+    else:
+        log("Текст выдачи Google через DOM пуст, пробую vision по скриншоту...")
+
+    # --- Шаг 2: vision-fallback по скриншоту (AI Overview/виджеты, ---
+    # --- которые не читаются простым inner_text) ---
+    shot_path = os.path.join(SCREENS_DIR, "screen_serp_00.png")
+    page.screenshot(path=shot_path)
+    vision_prompt = VISION_PROMPT_TMPL.format(topic=topic)
+    answer = timed_chat_vision(vision_client, vision_prompt, shot_path)
+    silent_aware_print(answer)
+    is_sufficient, element_text, _zoom_region = analyze_vision_answer(
+        text_client, answer, topic)
+
+    if (not is_sufficient and element_text
+            and cfg.getboolean("google", "expand_ai_overview", fallback=True)):
+        log(f"В выдаче найден потенциально полезный свёрнутый элемент "
+            f"(например AI Overview \"Показать ещё\"): \"{element_text}\". "
+            f"Пробую раскрыть...")
+        if try_expand_element(page, element_text):
+            time.sleep(1)
+            expanded_shot = os.path.join(SCREENS_DIR, "screen_serp_00_expanded.png")
+            page.screenshot(path=expanded_shot)
+            expanded_answer = timed_chat_vision(vision_client, vision_prompt, expanded_shot)
+            silent_aware_print(expanded_answer)
+            answer = f"{answer}\n\n[После раскрытия \"{element_text}\"]\n{expanded_answer}"
+            is_sufficient, _, _ = analyze_vision_answer(text_client, expanded_answer, topic)
+        else:
+            log(f"Элемент \"{element_text}\" найден в описании, но кликнуть "
+                f"по нему в выдаче не удалось.")
+
+    if is_sufficient:
+        log("Ответ уже есть прямо в выдаче Google (скриншот) - сайты "
+            "открывать не нужно.")
+        return answer
+
+    log("В выдаче Google готового ответа нет ни в тексте, ни на скриншоте, "
+        "перехожу к обычному обходу результатов поиска.")
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Универсальный поиск информации по заданной теме на "
@@ -1766,6 +1907,19 @@ def main():
                 search_box.press("Enter")
                 page.wait_for_selector("#search", timeout=10000)
 
+                final_answer = None
+                overall_sufficient = False
+                sites_tried = 0
+
+                # Сначала смотрим саму выдачу - вдруг ответ уже есть в
+                # сниппете/AI Overview и открывать сайты вообще не придётся.
+                snippet_answer = check_google_snippet_answer(
+                    page, vision_client, text_client, topic, cfg)
+                if snippet_answer is not None:
+                    final_answer = snippet_answer
+                    overall_sufficient = True
+                    candidate_urls = []
+
                 # Берём НЕСКОЛЬКО первых результатов - не только для
                 # обхода капчи, но и для того, чтобы попробовать СЛЕДУЮЩИЙ
                 # сайт целиком (текст+vision), если предыдущий не дал
@@ -1776,18 +1930,15 @@ def main():
                 # ответ быстрее и надёжнее - но пайплайн его даже не
                 # пробовал, раньше сразу уходя на валидацию первого
                 # неудачного результата.
-                result_links = page.locator("#search a:has(h3)")
-                result_count = min(result_links.count(), 5)
-                candidate_urls = []
-                for idx in range(result_count):
-                    href = result_links.nth(idx).get_attribute("href")
-                    if href:
-                        candidate_urls.append(href)
-                log(f"Кандидаты из выдачи Google: {candidate_urls}")
-
-                final_answer = None
-                overall_sufficient = False
-                sites_tried = 0
+                if snippet_answer is None:
+                    result_links = page.locator("#search a:has(h3)")
+                    result_count = min(result_links.count(), 5)
+                    candidate_urls = []
+                    for idx in range(result_count):
+                        href = result_links.nth(idx).get_attribute("href")
+                        if href:
+                            candidate_urls.append(href)
+                    log(f"Кандидаты из выдачи Google: {candidate_urls}")
 
                 for idx, candidate_url in enumerate(candidate_urls, start=1):
                     if sites_tried >= MAX_CANDIDATE_SITES_TO_TRY:
