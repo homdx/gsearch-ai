@@ -14,6 +14,8 @@ import sys
 import os
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main  # noqa: F401  (проверяем, что тонкий main.py импортируется)
@@ -102,6 +104,68 @@ def test_extract_main_page_text_filters_navigation():
     assert "50 рейсов" in text
     assert "Меню Игры" not in text
     assert "Metallista" not in text
+
+
+@pytest.mark.skipif(
+    not pipeline_core.HAS_TRAFILATURA,
+    reason="trafilatura не установлена (pip install trafilatura) - без неё "
+           "div-based меню без <nav>/<article> тегов не фильтруется, это "
+           "и есть весь смысл этого теста, а не баг старой эвристики",
+)
+def test_extract_main_page_text_readmode_filters_div_based_menu():
+    """Реальный случай: thedecisionlab.com/biases/gamblers-fallacy -
+    гигантское мега-меню (AI/Consulting/Industries/Resources и десятки
+    пунктов) свёрстано обычными <div>, БЕЗ единого <nav>/<header>/<article>
+    тега. Старая эвристика (decompose script/style/nav/header/footer,
+    иначе искать article/main) такое меню не отфильтровывала - оно
+    целиком утекало в текст, отправляемый в LLM, раньше самой статьи.
+
+    trafilatura находит основной контент по плотности текста и
+    типографике, а не по наличию тегов - должна выкинуть меню и
+    оставить только текст статьи, даже без единого семантического тега.
+    """
+    html = """
+    <html><body>
+    <div class="mega-menu">
+      <div>AI</div><div>Consulting</div><div>Industries</div><div>Resources</div>
+      <div><a href="/1">Data Analytics</a></div><div><a href="/2">Innovation</a></div>
+      <div><a href="/3">Strategy</a></div><div><a href="/4">Operations</a></div>
+      <div><a href="/5">People</a></div><div><a href="/6">Marketing</a></div>
+      <div><a href="/7">Risk</a></div><div><a href="/8">Health</a></div>
+      <div><a href="/9">Education</a></div><div><a href="/10">Climate</a></div>
+    </div>
+    <div class="content">
+    <h1>Gambler's fallacy</h1>
+    <p>The gambler's fallacy describes our belief that the probability of a
+    random event occurring in the future is influenced by previous instances
+    of that type of event. Consider Jane, who plays Blackjack and believes
+    her losing streak will end on the fifth day.</p>
+    </div>
+    </body></html>
+    """
+    text = pipeline_core.extract_main_page_text(
+        html, url="https://thedecisionlab.com/biases/gamblers-fallacy")
+    assert "gambler's fallacy" in text.lower()
+    assert "losing streak" in text.lower()
+    # пункты мега-меню не должны были попасть в текст статьи
+    for menu_item in ("Consulting", "Industries", "Data Analytics", "Operations"):
+        assert menu_item not in text
+
+
+def test_extract_main_page_text_falls_back_without_trafilatura():
+    """Если trafilatura недоступна в окружении (не установлена/сбой) -
+    функция не должна падать, а откатывается на старую эвристику по
+    тегам (article/main, иначе body минус script/style/nav/header/footer)."""
+    html = """
+    <html><body>
+    <nav>Меню Игры Поиск</nav>
+    <article><h1>Заголовок</h1><p>Основной текст статьи с фактом.</p></article>
+    </body></html>
+    """
+    with patch.object(pipeline_core, "HAS_TRAFILATURA", False):
+        text = pipeline_core.extract_main_page_text(html)
+    assert "Основной текст статьи" in text
+    assert "Меню Игры" not in text
 
 
 # ---------------------------------------------------------------------

@@ -31,7 +31,7 @@ Playwright/LLM, извлечение и анализ текста, скринш�
 ./chrome_profile).
 
 Установка (один раз):
-    pip install playwright beautifulsoup4
+    pip install playwright beautifulsoup4 trafilatura
     playwright install chromium
 
 Запуск:

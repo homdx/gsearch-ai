@@ -23,6 +23,38 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+# trafilatura делает настоящее "readability"-извлечение (как Reader Mode в
+# браузере/Safari/Firefox) - находит основной контент по плотности текста
+# и типографике, а не по наличию конкретных тегов <article>/<main>. Многие
+# современные сайты (Next.js/React) верстают гигантское мега-меню обычными
+# <div>, не <nav> - наша старая проверка (decompose script/style/nav/
+# header/footer) это меню не убирала, оно утекало в текст, который потом
+# отправлялся в LLM, разбавляя реальный контент статьи мусором и тратя
+# бюджет чанков впустую. Опционально: если библиотеки нет в окружении,
+# просто откатываемся на старую эвристику.
+try:
+    import trafilatura
+    HAS_TRAFILATURA = True
+except ImportError:
+    trafilatura = None
+    HAS_TRAFILATURA = False
+    # Явное предупреждение, а не тихий откат: без trafilatura
+    # extract_main_page_text() использует старую эвристику по тегам,
+    # которая НЕ фильтрует div-based меню без <nav>/<article> (см.
+    # docstring extract_main_page_text) - на части сайтов текст,
+    # уходящий в LLM, будет засорён навигацией без единого сообщения
+    # в логе о том, почему. log() тут ещё недоступен (определяется
+    # ниже по файлу), поэтому пишем прямо в stderr.
+    print(
+        "[pipeline_core] ВНИМАНИЕ: пакет trafilatura не установлен "
+        "(pip install trafilatura). Будет использована старая эвристика "
+        "извлечения текста, которая не фильтрует div-based меню без "
+        "<nav>/<article> тегов - качество извлечения текста на части "
+        "сайтов будет хуже, без явного предупреждения об этом в логе "
+        "прогона.",
+        file=sys.stderr,
+    )
+
 from llm_api import LLMClient
 
 RUN_STATS = {
@@ -700,7 +732,7 @@ BEST_EFFORT_PROMPT_TMPL = (
 )
 
 
-def extract_main_page_text(html: str) -> str:
+def extract_main_page_text(html: str, url: str = None) -> str:
     """Достаёт ОСНОВНОЙ текст страницы ЦЕЛИКОМ, без обрезки (а не
     узкие фрагменты по плотности ключевых слов, как find_bonus_blocks).
     Обрезка под конкретный бюджет контекста происходит ОТДЕЛЬНО, в
@@ -713,9 +745,32 @@ def extract_main_page_text(html: str) -> str:
     попал в узкую выборку кандидатов - при этом текст был ПРЯМО НА
     СТРАНИЦЕ, и полный проход по нему нашёл бы ответ без vision вообще.
 
-    Предпочитает <article>/<main>, если они есть (там обычно и лежит
-    сама статья/контент, без меню и рекламы) - иначе берёт <body>
-    целиком, вычищая <script>/<style>/<nav>/<header>/<footer>."""
+    Сначала пробуем trafilatura - это НАСТОЯЩЕЕ "Reader Mode"-извлечение
+    (как в браузере), находит контент по плотности текста и типографике,
+    а не по наличию тегов. Реальный случай: thedecisionlab.com верстает
+    мега-меню (десятки пунктов навигации, иконки, ссылки на все разделы
+    сайта) обычными <div>, без <nav> - старая эвристика (искать <article>/
+    <main>, иначе <body> минус script/style/nav/header/footer) на такой
+    странице пропускала всё меню прямиком в текст, отправляемый в LLM,
+    забивая бюджет чанков мусором раньше, чем до статьи доходила очередь.
+
+    Если trafilatura не установлена или ничего не смогла извлечь (совсем
+    нестандартная вёрстка) - откатываемся на старую эвристику по тегам,
+    чтобы функция не переставала работать вообще.
+    """
+    if HAS_TRAFILATURA:
+        try:
+            extracted = trafilatura.extract(
+                html, url=url,
+                favor_precision=True,  # лучше меньше, но точно основной текст, чем всё подряд
+                include_comments=False,
+                include_tables=True,
+            )
+            if extracted and len(extracted.strip()) >= 50:
+                return extracted.strip()
+        except Exception:
+            pass  # падаем на старую эвристику ниже
+
     soup = BeautifulSoup(html, "html.parser")
 
     container = soup.find("article") or soup.find("main")
@@ -830,7 +885,7 @@ def try_best_effort_answer(client: LLMClient, page_text: str, topic: str) -> str
     return None
 
 
-def try_full_page_text(client: LLMClient, html: str, topic: str) -> str:
+def try_full_page_text(client: LLMClient, html: str, topic: str, url: str = None) -> str:
     """Дополнительный "гейт" перед vision-fallback: проверяет ВЕСЬ
     основной текст страницы на достаточность ответа, а не только 5
     узких кандидатов из find_bonus_blocks.
@@ -842,7 +897,7 @@ def try_full_page_text(client: LLMClient, html: str, topic: str) -> str:
     MAX_TEXT_CHUNKS), а не тупо обрезается с потерей содержимого.
     Останавливается на первом куске, где найден содержательный ответ
     С ЦИФРАМИ, РЕАЛЬНО ВЗЯТЫМИ ИЗ ТЕКСТА (см. answer_numbers_grounded_in_source)."""
-    page_text = extract_main_page_text(html)
+    page_text = extract_main_page_text(html, url=url)
     if len(page_text) < 50:
         return None  # текста почти нет - vision точно понадобится
 
@@ -1280,7 +1335,7 @@ def run_pipeline(page, client: LLMClient, url: str, topic: str, keywords: list,
             # ОДНИМ запросом.
             log("Ни один узкий кандидат не подошёл. Пробую доп. проверку "
                 "по всему основному тексту страницы перед переходом к vision...")
-            full_text_answer = try_full_page_text(client, html, topic)
+            full_text_answer = try_full_page_text(client, html, topic, url=current_url)
             if full_text_answer:
                 log("Полный текст страницы дал содержательный ответ.")
                 return full_text_answer, current_url
