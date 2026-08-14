@@ -47,6 +47,17 @@ from llm_api import LLMClient
 # правке путей в одном месте и забытой в другом.
 SCREENS_DIR = "screens"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# БАГ (был): profile_dir по умолчанию был ОТНОСИТЕЛЬНЫМ ("chrome_profile"),
+# т.е. зависел от текущего рабочего каталога процесса. step1_open_chrome.py
+# при этом пишет профиль в АБСОЛЮТНЫЙ путь (SCRIPT_DIR/chrome_profile).
+# Если dispatcher.py / skill_runner.py запускали не из папки проекта,
+# Chrome молча создавал ПУСТОЙ профиль в другом месте - ручной логин из
+# step1 не подхватывался, и Google снова показывал капчу. Теперь путь
+# по умолчанию абсолютный и совпадает со step1_open_chrome.py.
+DEFAULT_PROFILE_DIR = os.path.join(SCRIPT_DIR, "chrome_profile")
+
 
 def _log(msg: str):
     """Как prim._log() — уважает silent-режим (общий флаг prim.SILENT,
@@ -82,7 +93,8 @@ def eval_condition(expr: str, context: dict) -> bool:
 
 
 def run_skill(skill_path: str, inputs: dict, headless: bool = False,
-              profile_dir: str = "chrome_profile", config_path: str = "config_vision.ini"):
+              profile_dir: str = DEFAULT_PROFILE_DIR,
+              config_path: str = "config_vision.ini"):
     with open(skill_path, "r", encoding="utf-8") as f:
         skill = yaml.safe_load(f)
 
@@ -150,11 +162,59 @@ def run_skill(skill_path: str, inputs: dict, headless: bool = False,
 
     step_error = None  # (message,) - если шаг провалился с on_error=stop
 
+    # БАГ (был): раннер запускал браузер "голым" - bundled Chromium вместо
+    # настоящего Chrome, с включённым по умолчанию флагом
+    # "--enable-automation" и navigator.webdriver=true. Для антибот-систем
+    # (в первую очередь Google) это явные признаки автоматизации, из-за
+    # которых капча показывалась заметно чаще - при том что main.py и
+    # step1_open_chrome.py давно запускались с антидетект-настройками.
+    # Теперь все три файла запускают браузер ОДИНАКОВО: ручной логин из
+    # step1 происходит ровно в том же окружении, в котором потом работает
+    # скилл, и профиль/фингерпринт не "разъезжаются" между запусками.
+    browser_kwargs = dict(
+        headless=headless,
+        channel="chrome",              # настоящий Chrome, не Chromium Playwright
+        viewport={"width": 1024, "height": 768},
+        # Таймаут запуска самого Chrome - из [browser], как в main.py:
+        # без него подвисший запуск (например конфликт с внешним
+        # proxychains-ng) висел бы бесконечно.
+        timeout=cfg.getint("browser", "launch_timeout_ms", fallback=30000),
+        ignore_default_args=["--enable-automation"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--test-type",
+        ],
+    )
+
+    # Прокси - из ОБЩЕЙ секции [proxy], тем же способом, что читают
+    # main.py и step1_open_chrome.py (browser_enabled с fallback на
+    # общий enabled). Раньше скиллы игнорировали её и ходили в Google
+    # с реального IP, даже когда main.py шёл через SOCKS5: для Google
+    # это выглядело как резкая смена гео у того же профиля - ещё один
+    # самостоятельный повод показать капчу.
+    _proxy_general = (cfg.has_section("proxy")
+                      and cfg.getboolean("proxy", "enabled", fallback=False))
+    _proxy_enabled = (cfg.has_section("proxy")
+                      and cfg.getboolean("proxy", "browser_enabled",
+                                         fallback=_proxy_general))
+    if _proxy_enabled:
+        _proxy_host = cfg.get("proxy", "host", fallback="127.0.0.1")
+        _proxy_port = cfg.getint("proxy", "port", fallback=1080)
+        browser_kwargs["proxy"] = {
+            "server": f"socks5://{_proxy_host}:{_proxy_port}",
+            "bypass": "localhost,127.0.0.1",
+        }
+        _log(f"Chrome запускается через SOCKS5-прокси {_proxy_host}:{_proxy_port}")
+
+    _log(f"Профиль Chrome: {profile_dir}")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            profile_dir, headless=headless, viewport={"width": 1024, "height": 768},
-        )
+        browser = p.chromium.launch_persistent_context(profile_dir, **browser_kwargs)
         page = browser.pages[0] if browser.pages else browser.new_page()
+        # Таймаут по умолчанию для всех навигационных операций - тоже из
+        # конфига, как в main.py, а не зашитый в примитивы хардкод.
+        page.set_default_timeout(
+            cfg.getint("browser", "navigation_timeout_ms", fallback=20000))
 
         for step in skill["steps"]:
             action_name = step["action"]
@@ -262,7 +322,10 @@ if __name__ == "__main__":
     parser.add_argument("--input", action="append", default=[],
                          help="key=value, можно несколько раз")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--profile-dir", default="chrome_profile")
+    parser.add_argument("--profile-dir", default=DEFAULT_PROFILE_DIR,
+                        help=f"Папка профиля Chrome (по умолчанию {DEFAULT_PROFILE_DIR}). "
+                             "Должна совпадать с той, в которой делался ручной "
+                             "логин через step1_open_chrome.py.")
     parser.add_argument("--config", default="config_vision.ini")
     args = parser.parse_args()
 

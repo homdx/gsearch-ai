@@ -185,16 +185,32 @@ def classify(user_input: str, client: LLMClient, skills: dict) -> dict:
 
 # ─── Запуск скилла ────────────────────────────────────────────────────────────
 
-def run_skill(skill_yaml: str, inputs: dict, config_path: str) -> dict:
+def run_skill(skill_yaml: str, inputs: dict, config_path: str,
+              profile_dir: str = None) -> dict:
     input_args = []
     for k, v in inputs.items():
         input_args += ["--input", f"{k}={v}"]
 
+    # БАГ (был): "skill_runner.py" - относительный путь, т.е. запуск
+    # dispatcher.py не из папки проекта падал с "can't open file".
+    # Берём соседний файл рядом с самим dispatcher.py.
+    runner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "skill_runner.py")
+
     cmd = [
-        sys.executable, "skill_runner.py", skill_yaml,
+        sys.executable, runner_path, skill_yaml,
         *input_args,
         "--config", config_path,
     ]
+
+    # БАГ (был): profile_dir не прокидывался вообще - если ручной логин
+    # через step1_open_chrome.py делался в НЕ дефолтный профиль
+    # (--profile-dir chrome_profile2), скилл всё равно уходил в дефолтный,
+    # незалогиненный, и получал капчу от Google. Профиль задаётся
+    # переменной окружения CHROME_PROFILE_DIR (отдельного CLI-флага нет:
+    # у dispatcher.py весь sys.argv - это текст запроса пользователя).
+    if profile_dir:
+        cmd += ["--profile-dir", profile_dir]
     dispatcher_print(f"[dispatcher] → {' '.join(cmd)}")
 
     # Popen со стримингом: stdout читаем построчно и сразу печатаем —
@@ -249,7 +265,8 @@ def run_skill(skill_yaml: str, inputs: dict, config_path: str) -> dict:
 
 # ─── Основной цикл ────────────────────────────────────────────────────────────
 
-def dispatch(user_input: str, client: LLMClient, skills: dict, config_path: str) -> dict:
+def dispatch(user_input: str, client: LLMClient, skills: dict, config_path: str,
+             profile_dir: str = None) -> dict:
     """Возвращает структурированный результат в ТОМ ЖЕ формате, что и
     write_result_and_exit() в main.py / финальный JSON в skill_runner.py:
     started_at/finished_at/duration_seconds/llm_requests_total — чтобы
@@ -313,7 +330,7 @@ def dispatch(user_input: str, client: LLMClient, skills: dict, config_path: str)
     if confidence < 0.5:
         return finalize(False, f"Низкая уверенность ({confidence:.2f}) в распознавании: «{user_input}»", None)
 
-    skill_result = run_skill(skills[intent]["yaml"], inputs, config_path)
+    skill_result = run_skill(skills[intent]["yaml"], inputs, config_path, profile_dir)
 
     if skill_result.get("success"):
         return finalize(True, None, skill_result.get("final_answer") or "(пустой ответ)", skill_result)
@@ -369,6 +386,14 @@ def main():
     )
     client, cfg = load_client(config_path)
 
+    # Профиль Chrome: если не задан - skill_runner.py возьмёт свой
+    # дефолт (SCRIPT_DIR/chrome_profile), тот же, что у
+    # step1_open_chrome.py. Переопределить можно так:
+    #     CHROME_PROFILE_DIR=/путь/chrome_profile2 python3 dispatcher.py "запрос"
+    profile_dir = os.environ.get("CHROME_PROFILE_DIR") or None
+    if profile_dir:
+        profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
+
     # Загружаем скиллы из YAML при старте
     skills = load_skills()
     if not skills:
@@ -380,7 +405,7 @@ def main():
 
     if len(sys.argv) > 1:
         user_input = " ".join(sys.argv[1:])
-        result = dispatch(user_input, client, skills, config_path)
+        result = dispatch(user_input, client, skills, config_path, profile_dir)
         if SILENT:
             # silent = true -> ТОЛЬКО JSON на stdout, как в main.py и
             # skill_runner.py - никакого текста ни до, ни после.
@@ -398,7 +423,7 @@ def main():
                 break
             if not user_input or user_input.lower() in ("выход", "exit", "quit", "q"):
                 break
-            result = dispatch(user_input, client, skills, config_path)
+            result = dispatch(user_input, client, skills, config_path, profile_dir)
             if SILENT:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
